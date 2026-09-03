@@ -1,0 +1,28 @@
+# Sanal ortam
+venv/
+.venv/
+
+# Vektor veritabani
+vektor_db/
+
+# Sohbet kayitlari
+sohbetler.json
+
+# Test ve gercek dokumanlar
+dokumanlar/
+
+# Python
+__pycache__/
+*.pyc
+
+# React
+node_modules/
+dist/
+
+# Editor
+.vscode/
+.idea/
+
+# Isletim sistemi
+Thumbs.db
+.DS_Store
