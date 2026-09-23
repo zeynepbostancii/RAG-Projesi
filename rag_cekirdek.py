@@ -6,7 +6,9 @@ Bu ayrim onemli: is mantigi tek yerde durur, arayuz degistiginde
 yeniden yazilmaz.
 """
 
+import hashlib
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 
 import ollama
@@ -30,6 +32,17 @@ RERANKER_ADI = "BAAI/bge-reranker-base"
 ADAY_SAYISI = 20
 SONUC_SAYISI = 5
 GECMIS_TUR = 3
+
+# Ayni soru tekrar sorulursa modeli yeniden calistirmamak icin basit onbellek.
+# CPU'da her cevap dakikalar surdugu icin bu ciddi kazanc saglıyor.
+# Anahtar: soru + secili dosyalar. Gecmis anahtara dahil DEGIL, cunku
+# yeniden yazilmis soru zaten baglami tasiyor.
+ONBELLEK_SINIR = 200
+_onbellek = OrderedDict()
+
+# Modelin "bulamadim" cevabini tanimak icin. Bu durumda kaynak gosterilmiyor,
+# cunku gosterilecek bir dayanak yok.
+BULUNAMADI = "Bu bilgi dokumanlarda bulunmuyor."
 
 YENIDEN_YAZ = """Kullanicinin son sorusunu arama motoruna verilecek tek bir
 soru haline getir.
@@ -147,6 +160,7 @@ def dosya_sil(ad):
             FieldCondition(key="dosya", match=MatchValue(value=ad))
         ]),
     )
+    onbellek_temizle()
 
 
 def dokuman_ekle(dosya_adi, ikili_veri, yontem="semantik"):
@@ -190,6 +204,10 @@ def dokuman_ekle(dosya_adi, ikili_veri, yontem="semantik"):
         for i, p in enumerate(parcalar)
     ]
     _client.upsert(collection_name=KOLEKSIYON, points=noktalar)
+
+    # Arsiv degisti, eski cevaplar gecersiz olabilir
+    onbellek_temizle()
+
     return len(noktalar)
 
 
@@ -263,23 +281,53 @@ def ara(soru, dosyalar=None, adet=SONUC_SAYISI):
     ]
 
 
+def _onbellek_anahtari(soru, dosyalar):
+    """Soru ve dosya kapsamindan tekrarlanabilir bir anahtar uretir."""
+    kapsam = ",".join(sorted(dosyalar)) if dosyalar else "*"
+    ham = f"{soru.strip().lower()}|{kapsam}"
+    return hashlib.sha256(ham.encode("utf-8")).hexdigest()
+
+
+def onbellek_temizle():
+    _onbellek.clear()
+
+
+def cevap_bulunamadi_mi(metin):
+    """Model 'bulamadim' mi dedi? Kaynak gosterip gostermemek icin."""
+    sade = metin.strip().lower()
+    return "dokumanlarda bulunmuyor" in sade or "dokümanlarda bulunmuyor" in sade
+
+
 def cevapla(soru, dosyalar=None, gecmis=None):
     """
     Tam RAG akisi: soruyu yeniden yaz, ara, LLM'e sor.
 
-    Donen deger: cevap metni, kullanilan parcalar, arama sorusu.
+    Donen deger: cevap metni, kullanilan parcalar, arama sorusu, onbellek
+    kullanildi mi bilgisi.
     """
     gecmis = gecmis or []
-    arama_sorusu, degisti = soruyu_yeniden_yaz(soru, gecmis)
 
+    # Takip sorulari baglama bagli oldugu icin onbelleklenmiyor.
+    # "peki kim sorumlu" sorusu her sohbette farkli anlama geliyor.
+    onbelleklenebilir = not gecmis
+    anahtar = _onbellek_anahtari(soru, dosyalar) if onbelleklenebilir else None
+
+    if anahtar and anahtar in _onbellek:
+        _onbellek.move_to_end(anahtar)          # en son kullanilan sona
+        sonuc = dict(_onbellek[anahtar])
+        sonuc["onbellek"] = True
+        return sonuc
+
+    arama_sorusu, degisti = soruyu_yeniden_yaz(soru, gecmis)
     parcalar = ara(arama_sorusu, dosyalar)
 
     if not parcalar:
         return {
-            "cevap": "Secili dosyalarda sonuc bulunamadi.",
+            "cevap": BULUNAMADI,
             "parcalar": [],
             "arama_sorusu": arama_sorusu if degisti else None,
             "kaynaklar": [],
+            "onbellek": False,
         }
 
     baglam = "".join(
@@ -293,10 +341,188 @@ def cevapla(soru, dosyalar=None, gecmis=None):
                    "content": SABLON.format(baglam=baglam, soru=arama_sorusu)}],
         options={"temperature": 0.1},
     )
+    metin = yanit["message"]["content"]
 
-    return {
-        "cevap": yanit["message"]["content"],
+    # Model bilgiyi bulamadiysa kaynak gostermenin anlami yok —
+    # kullaniciyi ilgisiz parcalari incelemeye yonlendirmis oluruz.
+    if cevap_bulunamadi_mi(metin):
+        parcalar = []
+
+    sonuc = {
+        "cevap": metin,
         "parcalar": parcalar,
         "arama_sorusu": arama_sorusu if degisti else None,
         "kaynaklar": sorted({p["dosya"] for p in parcalar}),
+        "onbellek": False,
+    }
+
+    if anahtar:
+        _onbellek[anahtar] = sonuc
+        if len(_onbellek) > ONBELLEK_SINIR:
+            _onbellek.popitem(last=False)       # en eski kaydi at
+
+    return sonuc
+
+
+
+# ============================================================
+# DOKUMAN ANALIZI
+#
+# RAG akisindan farkli: burada parca aramiyoruz, dokumanin
+# tamamini isliyoruz. Uzun dokumanlar model baglamina sigmadigi
+# icin "map-reduce" yontemi kullaniliyor: once gruplar ayri ayri
+# ozetleniyor (map), sonra ozetler birlestiriliyor (reduce).
+# ============================================================
+
+# Tek seferde modele verilecek azami karakter. Baglam penceresini
+# asmamak icin temkinli tutuldu.
+GRUP_BOYU = 6000
+
+OZET_PARCA = """Asagida bir dokumanin bir bolumu var. Bu bolumdeki
+onemli bilgileri maddeler halinde cikar.
+
+Kurallar:
+- Sadece metinde yazani yaz, yorum ekleme.
+- Sayilari, tarihleri, isimleri ve kodlari aynen koru.
+- En fazla 8 madde.
+
+--- BOLUM ---
+{metin}
+--- BOLUM SONU ---
+
+MADDELER:"""
+
+OZET_BIRLESTIR = """Asagida bir dokumanin bolum bolum cikarilmis
+maddeleri var. Bunlari tek bir ozete birlestir.
+
+Kurallar:
+- Tekrarlari birlestir, celisen bilgi varsa ikisini de belirt.
+- Sayilari, tarihleri ve isimleri aynen koru.
+- Once 2-3 cumlelik genel bir ozet yaz, sonra "Onemli noktalar"
+  basligi altinda maddeleri sirala.
+- Metinde olmayan bilgi ekleme.
+
+--- MADDELER ---
+{maddeler}
+--- MADDELER SONU ---
+
+OZET:"""
+
+KARSILASTIR = """Asagida iki dokumanin ozetleri var. Bunlari karsilastir.
+
+Kurallar:
+- Once "Ortak noktalar", sonra "Farklar" basligi kullan.
+- Bir konuda iki dokuman celisiyorsa bunu ayrica belirt ve
+  hangi dokumanda ne yazdigini yaz.
+- Sadece bir dokumanda gecen onemli bilgileri "Yalniz X'te var"
+  seklinde belirt.
+- Sayilari ve tarihleri aynen koru, hesaplama yapma.
+- Metinlerde olmayan bilgi ekleme, yorum katma.
+{odak_satiri}
+--- {ad1} ---
+{ozet1}
+
+--- {ad2} ---
+{ozet2}
+
+KARSILASTIRMA:"""
+
+
+def dokuman_metni(ad):
+    """Bir dosyanin tum parcalarini sirayla birlestirip dondurur."""
+    parcalar = []
+    sonraki = None
+    while True:
+        kayitlar, sonraki = _client.scroll(
+            collection_name=KOLEKSIYON,
+            scroll_filter=Filter(must=[
+                FieldCondition(key="dosya", match=MatchValue(value=ad))
+            ]),
+            limit=1000,
+            offset=sonraki,
+            with_payload=True,
+            with_vectors=False,
+        )
+        parcalar.extend(kayitlar)
+        if sonraki is None:
+            break
+
+    parcalar.sort(key=lambda k: k.payload.get("parca_no", 0))
+    return [k.payload.get("metin", "") for k in parcalar]
+
+
+def _gruplara_ayir(parcalar, sinir=GRUP_BOYU):
+    """Parcalari, her biri sinira sigacak gruplara toplar."""
+    gruplar, tampon = [], ""
+    for p in parcalar:
+        if len(tampon) + len(p) > sinir and tampon:
+            gruplar.append(tampon)
+            tampon = p
+        else:
+            tampon = (tampon + "\n" + p) if tampon else p
+    if tampon:
+        gruplar.append(tampon)
+    return gruplar
+
+
+def _llm(istem, sicaklik=0.1):
+    yanit = ollama.chat(
+        model=MODEL_ADI,
+        messages=[{"role": "user", "content": istem}],
+        options={"temperature": sicaklik},
+    )
+    return yanit["message"]["content"].strip()
+
+
+def ozetle(ad, azami_grup=8):
+    """
+    Dokumani ozetler.
+
+    azami_grup: islenecek en fazla grup sayisi. CPU'da her grup ayri
+    bir LLM cagrisi demek, cok uzun dokumanlarda sure kontrol altinda
+    tutulmali. Sinir asilirsa ozet kismi olur ve bu bildirilir.
+    """
+    parcalar = dokuman_metni(ad)
+    if not parcalar:
+        return {"ozet": "Bu dosya arsivde bulunamadi.", "kismi": False,
+                "grup_sayisi": 0}
+
+    gruplar = _gruplara_ayir(parcalar)
+    kismi = len(gruplar) > azami_grup
+    gruplar = gruplar[:azami_grup]
+
+    # Tek gruba sigiyorsa dogrudan ozetle
+    if len(gruplar) == 1:
+        ozet = _llm(OZET_BIRLESTIR.format(maddeler=gruplar[0]))
+        return {"ozet": ozet, "kismi": kismi, "grup_sayisi": 1}
+
+    # Map: her grubu ayri ozetle
+    maddeler = []
+    for i, grup in enumerate(gruplar, start=1):
+        maddeler.append(f"[Bolum {i}]\n" + _llm(OZET_PARCA.format(metin=grup)))
+
+    # Reduce: ozetleri birlestir
+    ozet = _llm(OZET_BIRLESTIR.format(maddeler="\n\n".join(maddeler)))
+    return {"ozet": ozet, "kismi": kismi, "grup_sayisi": len(gruplar)}
+
+
+def karsilastir(ad1, ad2, odak=None):
+    """Iki dokumani karsilastirir."""
+    o1 = ozetle(ad1)
+    o2 = ozetle(ad2)
+
+    odak_satiri = ""
+    if odak and odak.strip():
+        odak_satiri = f"- Ozellikle su konuya odaklan: {odak.strip()}\n"
+
+    metin = _llm(KARSILASTIR.format(
+        odak_satiri=odak_satiri,
+        ad1=ad1, ozet1=o1["ozet"],
+        ad2=ad2, ozet2=o2["ozet"],
+    ))
+
+    return {
+        "karsilastirma": metin,
+        "ozetler": {ad1: o1["ozet"], ad2: o2["ozet"]},
+        "kismi": o1["kismi"] or o2["kismi"],
     }

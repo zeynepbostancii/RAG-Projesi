@@ -1,7 +1,6 @@
 import uuid
 from pathlib import Path
 
-import streamlit as st
 import ollama
 from sentence_transformers import SentenceTransformer, CrossEncoder
 from qdrant_client import QdrantClient

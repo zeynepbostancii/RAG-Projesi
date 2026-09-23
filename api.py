@@ -8,8 +8,10 @@ Otomatik dokumantasyon:
     http://localhost:8000/docs
 """
 
+import base64
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -50,12 +52,55 @@ class CevapYaniti(BaseModel):
     kaynaklar: list[str]
     arama_sorusu: str | None = None
     parcalar: list[Parca]
+    onbellek: bool = Field(
+        False, description="Cevap onbellekten mi geldi"
+    )
+
+
+class OzetIstegi(BaseModel):
+    dosya: str = Field(..., description="Ozetlenecek dosyanin adi")
+
+
+class OzetYaniti(BaseModel):
+    dosya: str
+    ozet: str
+    kismi: bool = Field(
+        False, description="Dokuman cok uzun oldugu icin ozet kismi mi"
+    )
+    grup_sayisi: int
+
+
+class KarsilastirIstegi(BaseModel):
+    dosyalar: list[str] = Field(
+        ..., min_length=2, max_length=2,
+        description="Karsilastirilacak iki dosyanin adi",
+    )
+    odak: str | None = Field(
+        None, description="Karsilastirmada one cikarilacak konu (istege bagli)"
+    )
+
+
+class KarsilastirYaniti(BaseModel):
+    dosyalar: list[str]
+    karsilastirma: str
+    ozetler: dict[str, str]
+    kismi: bool = False
 
 
 class YuklemeYaniti(BaseModel):
     dosya: str
     parca_sayisi: int
     durum: str
+
+
+class DisKaynakIstegi(BaseModel):
+    kaynak_url: str = Field(
+        ..., description="Dosyayi base64 olarak donduren web servisin adresi"
+    )
+    yontem: str = Field("semantik", pattern="^(semantik|sabit)$")
+    basliklar: dict[str, str] | None = Field(
+        None, description="Kaynak servise gonderilecek ek HTTP basliklari (orn. Authorization)"
+    )
 
 
 # ---------- Uygulama ----------
@@ -129,6 +174,64 @@ async def dokuman_yukle(
     )
 
 
+@app.post("/dokumanlar/disardan", response_model=YuklemeYaniti,
+          summary="Harici bir web servisten dokuman cek ve ekle")
+async def dokuman_disardan_yukle(istek: DisKaynakIstegi):
+    """
+    Dosya bizim veritabaninda degil, baska bir web servisinde tutuluyorsa
+    kullanilir. Servis, dosyayi JSON icinde base64 olarak dondurmeli:
+
+        {"dosya_adi": "rapor.pdf", "icerik_base64": "JVBERi0xLjQK..."}
+
+    Base64 cozulup ayni /dokumanlar akisina (okuma, parcalama, vektorleme,
+    kaydetme) sokulur. Yani kaynak fark etmeksizin sonuc ayni sekilde
+    aranabilir hale gelir.
+    """
+    async with httpx.AsyncClient(timeout=30.0) as istemci:
+        try:
+            yanit = await istemci.get(istek.kaynak_url, headers=istek.basliklar or {})
+            yanit.raise_for_status()
+        except httpx.HTTPError as hata:
+            raise HTTPException(
+                status_code=502, detail=f"Kaynak servise ulasilamadi: {hata}"
+            )
+
+    try:
+        veri = yanit.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=502, detail="Kaynak servis JSON dondurmedi"
+        )
+
+    dosya_adi = veri.get("dosya_adi") or veri.get("file_name")
+    b64_icerik = veri.get("icerik_base64") or veri.get("file_base64")
+
+    if not dosya_adi or not b64_icerik:
+        raise HTTPException(
+            status_code=502,
+            detail="Kaynak servis 'dosya_adi' ve 'icerik_base64' alanlarini dondurmeli",
+        )
+
+    try:
+        ikili_veri = base64.b64decode(b64_icerik)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Gecersiz base64 icerik")
+
+    adet = rag.dokuman_ekle(dosya_adi, ikili_veri, istek.yontem)
+
+    if adet == -1:
+        raise HTTPException(
+            status_code=415, detail=f"Desteklenmeyen dosya tipi: {dosya_adi}"
+        )
+    if adet == 0:
+        raise HTTPException(
+            status_code=422,
+            detail="Dosyadan metin cikarilamadi (taranmis PDF olabilir)",
+        )
+
+    return YuklemeYaniti(dosya=dosya_adi, parca_sayisi=adet, durum="eklendi")
+
+
 @app.delete("/dokumanlar/{ad}", summary="Dokuman sil")
 def dokuman_sil(ad: str):
     mevcut = rag.dosyalari_listele()
@@ -153,3 +256,49 @@ def sor(istek: SoruIstegi):
     gecmis = [t.model_dump() for t in istek.gecmis]
     sonuc = rag.cevapla(istek.soru, istek.dosyalar, gecmis)
     return CevapYaniti(**sonuc)
+
+
+@app.post("/ozet", response_model=OzetYaniti, summary="Dokuman ozeti cikar")
+def ozet(istek: OzetIstegi):
+    """
+    Dokumanin tamamini isler. RAG aramasindan farkli olarak parca
+    secmez, butun metni gruplar halinde ozetleyip birlestirir.
+    Uzun dokumanlarda birden fazla LLM cagrisi yapar, sure alabilir.
+    """
+    mevcut = rag.dosyalari_listele()
+    if istek.dosya not in mevcut:
+        raise HTTPException(
+            status_code=404, detail=f"Dosya bulunamadi: {istek.dosya}"
+        )
+
+    sonuc = rag.ozetle(istek.dosya)
+    return OzetYaniti(dosya=istek.dosya, **sonuc)
+
+
+@app.post("/karsilastir", response_model=KarsilastirYaniti,
+          summary="Iki dokumani karsilastir")
+def karsilastir(istek: KarsilastirIstegi):
+    mevcut = rag.dosyalari_listele()
+    for ad in istek.dosyalar:
+        if ad not in mevcut:
+            raise HTTPException(
+                status_code=404, detail=f"Dosya bulunamadi: {ad}"
+            )
+
+    if istek.dosyalar[0] == istek.dosyalar[1]:
+        raise HTTPException(
+            status_code=400, detail="Iki farkli dosya secilmeli"
+        )
+
+    sonuc = rag.karsilastir(istek.dosyalar[0], istek.dosyalar[1], istek.odak)
+    return KarsilastirYaniti(dosyalar=istek.dosyalar, **sonuc)
+
+
+@app.delete("/onbellek", summary="Cevap onbellegini temizle")
+def onbellek_temizle():
+    """
+    Ayni soruya verilen cevaplar onbellekte tutuluyor. Dokuman eklenip
+    silindiginde otomatik temizleniyor, ama elle de bosaltilabilir.
+    """
+    rag.onbellek_temizle()
+    return {"durum": "temizlendi"}

@@ -31,3 +31,17 @@ export const sor = (soru, dosyalar, gecmis) =>
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ soru, dosyalar, gecmis }),
   })
+
+export const ozet = (dosya) =>
+  istek('/ozet', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dosya }),
+  })
+
+export const karsilastir = (dosyalar, odak) =>
+  istek('/karsilastir', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ dosyalar, odak: odak || null }),
+  })

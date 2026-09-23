@@ -73,6 +73,40 @@ export const Gonder = (p) => (
   </svg>
 )
 
+export const Ozet = (p) => (
+  <svg {...ortak} {...p}>
+    <path d="M4 6h16M4 11h16M4 16h9" />
+  </svg>
+)
+
+export const Karsilastir = (p) => (
+  <svg {...ortak} {...p}>
+    <rect x="3" y="4" width="7" height="16" rx="1.5" />
+    <rect x="14" y="4" width="7" height="16" rx="1.5" />
+    <path d="M10.5 12h3" />
+  </svg>
+)
+
+export const Ara = (p) => (
+  <svg {...ortak} {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="M20 20l-3.5-3.5" />
+  </svg>
+)
+
+export const Yildirim = (p) => (
+  <svg {...ortak} {...p}>
+    <path d="M13 2L4.5 13H11l-1 9 8.5-11H12l1-9z" />
+  </svg>
+)
+
+export const Yukle = (p) => (
+  <svg {...ortak} {...p}>
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <path d="M7 9l5-5 5 5M12 4v12" />
+  </svg>
+)
+
 // BTC kurumsal markası — degrade kare üzerinde beyaz harfler.
 // Resim yerine SVG: her ekran yoğunluğunda net, tema değişiminden etkilenmez.
 export const BtcLogo = ({ boyut = 30 }) => (
